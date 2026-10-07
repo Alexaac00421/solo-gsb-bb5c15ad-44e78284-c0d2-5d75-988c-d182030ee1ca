@@ -89,6 +89,41 @@ def broadcast(client, a, at=None):
     return client.get("/api/broadcast", params=params).json()["results"]
 
 
+def schedule(client, a, frm, to):
+    return client.get("/api/broadcast/schedule",
+                      params={"area": a, "from": frm, "to": to})
+
+
+def assert_tiling(body):
+    """片段序列无缝覆盖 [from, to)、升序不重叠、相邻内容不同（合并语义）。"""
+    segs = body["segments"]
+    assert body["count"] == len(segs) >= 1
+    assert segs[0]["from"] == body["from"]
+    assert segs[-1]["to"] == body["to"]
+    for s in segs:
+        assert parse(s["from"]) < parse(s["to"])  # 左闭右开、非空
+    for s1, s2 in zip(segs, segs[1:]):
+        assert s1["to"] == s2["from"]             # 无缝衔接
+        k1 = (s1["alert_no"], s1["level"], s1["message"])
+        k2 = (s2["alert_no"], s2["level"], s2["message"])
+        assert k1 != k2                            # 相邻片段内容必然不同
+
+
+def assert_segments_match_point_query(client, a, body):
+    """每个片段内抽样时刻（左端点与中点）的裁决与单点查询一致。"""
+    for seg in body["segments"]:
+        start, end = parse(seg["from"]), parse(seg["to"])
+        for moment in (start, start + (end - start) / 2):
+            res = broadcast(client, a, at=iso(moment))
+            if seg["alert_no"] is None:
+                assert res == [], (seg, iso(moment), res)
+            else:
+                assert len(res) == 1, (seg, iso(moment), res)
+                assert res[0]["alert_no"] == seg["alert_no"]
+                assert res[0]["level"] == seg["level"]
+                assert res[0]["message"] == seg["message"]
+
+
 # ---------------------------------------------------------------- 基础受理
 
 def test_health(client):
@@ -703,3 +738,245 @@ def test_failed_amend_leaves_no_state_and_frees_request_no(client):
     # 当前播发只体现成功的那一次修订；原版历史不变
     assert broadcast(client, a)[0]["message"] == "真正修订"
     assert broadcast(client, a, at=pub["effective_from"])[0]["message"] == "原版"
+
+
+# ---------------------------------------------------------------- 时段查询：入参校验
+
+@pytest.mark.parametrize("params", [
+    {"area": "X"},                                                        # 缺 from/to
+    {"area": "X", "from": "2026-10-06T08:00:00Z"},                        # 缺 to
+    {"area": "X", "from": "2026-10-06T08:00:00", "to": "2026-10-06T09:00:00Z"},   # from 无时区
+    {"area": "X", "from": "2026-10-06T08:00:00Z", "to": "2026-10-06T09:00:00"},   # to 无时区
+    {"area": "X", "from": "2026-10-06T09:00:00Z", "to": "2026-10-06T08:00:00Z"},  # 起点晚于终点
+    {"area": "X", "from": "2026-10-06T08:00:00Z", "to": "2026-10-06T08:00:00Z"},  # 起点等于终点
+    {"area": "X", "from": "2026-10-06T08:00:00Z", "to": "2026-10-07T08:00:01Z"},  # 跨度超 24h
+    {"area": "  ", "from": "2026-10-06T08:00:00Z", "to": "2026-10-06T09:00:00Z"},  # 空白区域
+    {"area": "X", "from": "not-a-time", "to": "2026-10-06T09:00:00Z"},    # 非法时刻
+])
+def test_schedule_invalid_requests_rejected(client, params):
+    r = client.get("/api/broadcast/schedule", params=params)
+    assert r.status_code == 422, r.text
+
+
+def test_schedule_exactly_24h_allowed(client):
+    r = schedule(client, area(), "2026-10-06T08:00:00Z", "2026-10-07T08:00:00Z")
+    assert r.status_code == 200
+
+
+def test_schedule_timezone_offset_normalized(client):
+    # 带 +08:00 偏移的起止时刻被正确解析，响应统一为 UTC
+    r = schedule(client, area(), "2026-10-06T16:00:00+08:00", "2026-10-06T17:00:00+08:00")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["from"] == "2026-10-06T08:00:00Z"
+    assert body["to"] == "2026-10-06T09:00:00Z"
+
+
+# ---------------------------------------------------------------- 时段查询：基本形态
+
+def test_schedule_empty_window_single_null_segment(client):
+    a = area()
+    body = schedule(client, a, "2026-10-06T08:00:00Z", "2026-10-06T09:00:00Z").json()
+    assert body["area"] == a
+    assert body["count"] == 1
+    seg = body["segments"][0]
+    assert seg["from"] == "2026-10-06T08:00:00Z"
+    assert seg["to"] == "2026-10-06T09:00:00Z"
+    assert seg["alert_no"] is None and seg["level"] is None and seg["message"] is None
+
+
+def test_schedule_publish_window_boundaries(client):
+    a = area()
+    pub = client.post("/api/commands/publish", json=publish_payload(
+        areas=[a], level=4, delay_seconds=3, duration_seconds=10)).json()
+    frm = iso(parse(pub["effective_from"]) - timedelta(seconds=5))
+    to = iso(parse(pub["effective_to"]) + timedelta(seconds=5))
+    body = schedule(client, a, frm, to).json()
+    assert_tiling(body)
+    kinds = [s["alert_no"] for s in body["segments"]]
+    assert kinds == [None, pub["alert_no"], None]
+    # 边界精确落在生效/到期时刻，边界时刻属于后一段
+    assert body["segments"][0]["to"] == pub["effective_from"]
+    assert body["segments"][1]["from"] == pub["effective_from"]
+    assert body["segments"][1]["to"] == pub["effective_to"]
+    assert body["segments"][1]["level"] == 4
+    # 单点查询在边界时刻的裁决与后一段一致
+    assert broadcast(client, a, at=pub["effective_from"])[0]["alert_no"] == pub["alert_no"]
+    assert broadcast(client, a, at=pub["effective_to"]) == []
+    assert_segments_match_point_query(client, a, body)
+
+
+def test_schedule_revoke_boundary(client):
+    a = area()
+    pub = client.post("/api/commands/publish", json=publish_payload(
+        areas=[a], duration_seconds=3600)).json()
+    rv = client.post("/api/commands/revoke",
+                     json={"request_no": rid(), "alert_no": pub["alert_no"]}).json()
+    frm = iso(parse(pub["effective_from"]) - timedelta(seconds=5))
+    to = iso(parse(rv["revoked_at"]) + timedelta(seconds=5))
+    body = schedule(client, a, frm, to).json()
+    assert_tiling(body)
+    kinds = [s["alert_no"] for s in body["segments"]]
+    assert kinds == [None, pub["alert_no"], None]
+    # 撤销时刻起不再播发：撤销边界属于后面的空段
+    assert body["segments"][1]["to"] == rv["revoked_at"]
+    assert body["segments"][2]["from"] == rv["revoked_at"]
+    assert broadcast(client, a, at=rv["revoked_at"]) == []
+    assert_segments_match_point_query(client, a, body)
+
+
+# ---------------------------------------------------------------- 时段查询：修订
+
+def test_schedule_amend_version_switch(client):
+    a = area()
+    pub = client.post("/api/commands/publish", json=publish_payload(
+        areas=[a], level=3, message="原版文案", duration_seconds=3600)).json()
+    am = do_amend(client, pub["alert_no"], areas=[a], level=5,
+                  message="修订版文案").json()
+    frm = iso(parse(pub["effective_from"]) - timedelta(seconds=5))
+    to = iso(parse(am["amended_at"]) + timedelta(seconds=5))
+    body = schedule(client, a, frm, to).json()
+    assert_tiling(body)
+    segs = body["segments"]
+    assert [s["alert_no"] for s in segs] == [None, pub["alert_no"], pub["alert_no"]]
+    # 修订受理时刻前为旧版、时刻起为新版（边界属于后一段）
+    assert segs[1]["to"] == am["amended_at"]
+    assert segs[2]["from"] == am["amended_at"]
+    assert (segs[1]["level"], segs[1]["message"]) == (3, "原版文案")
+    assert (segs[2]["level"], segs[2]["message"]) == (5, "修订版文案")
+    assert_segments_match_point_query(client, a, body)
+
+
+def test_schedule_amend_area_switch(client):
+    a1, a2 = area(), area()
+    pub = client.post("/api/commands/publish", json=publish_payload(
+        areas=[a1], duration_seconds=3600)).json()
+    am = do_amend(client, pub["alert_no"], areas=[a2]).json()
+    frm = iso(parse(pub["effective_from"]) - timedelta(seconds=5))
+    to = iso(parse(am["amended_at"]) + timedelta(seconds=5))
+
+    # 旧区域：修订时刻起停播
+    body1 = schedule(client, a1, frm, to).json()
+    assert_tiling(body1)
+    assert [s["alert_no"] for s in body1["segments"]] == [None, pub["alert_no"], None]
+    assert body1["segments"][1]["to"] == am["amended_at"]
+
+    # 新区域：修订时刻起开播
+    body2 = schedule(client, a2, frm, to).json()
+    assert_tiling(body2)
+    assert [s["alert_no"] for s in body2["segments"]] == [None, pub["alert_no"]]
+    assert body2["segments"][1]["from"] == am["amended_at"]
+    assert_segments_match_point_query(client, a1, body1)
+    assert_segments_match_point_query(client, a2, body2)
+
+
+# ---------------------------------------------------------------- 时段查询：抢占与恢复
+
+def test_schedule_preemption_and_lower_level_resume(client):
+    a = area()
+    low = client.post("/api/commands/publish", json=publish_payload(
+        areas=[a], level=1, message="低级别", duration_seconds=3600)).json()
+    high = client.post("/api/commands/publish", json=publish_payload(
+        areas=[a], level=5, message="高级别", delay_seconds=3, duration_seconds=6)).json()
+    frm = iso(parse(low["effective_from"]) - timedelta(seconds=2))
+    to = iso(parse(high["effective_to"]) + timedelta(seconds=5))
+    body = schedule(client, a, frm, to).json()
+    assert_tiling(body)
+    kinds = [(s["alert_no"], s["level"]) for s in body["segments"]]
+    # 空档 → 低级别 → 高级别抢占 → 高级别到期后低级别恢复
+    assert kinds == [(None, None), (low["alert_no"], 1),
+                     (high["alert_no"], 5), (low["alert_no"], 1)]
+    assert body["segments"][2]["from"] == high["effective_from"]
+    assert body["segments"][2]["to"] == high["effective_to"]
+    assert_segments_match_point_query(client, a, body)
+
+
+def test_schedule_merges_adjacent_identical_segments(client):
+    a = area()
+    # 高级别告警覆盖整个窗口；低级别告警在窗口内升起又落下，裁决始终不变
+    high = client.post("/api/commands/publish", json=publish_payload(
+        areas=[a], level=5, message="主导告警", duration_seconds=3600)).json()
+    low = client.post("/api/commands/publish", json=publish_payload(
+        areas=[a], level=1, message="被压制", delay_seconds=2, duration_seconds=5)).json()
+    frm = iso(parse(high["effective_from"]) - timedelta(seconds=2))
+    to = iso(parse(low["effective_to"]) + timedelta(seconds=5))
+    body = schedule(client, a, frm, to).json()
+    # 低级别的生效/到期边界不改变裁决 → 被合并，仅剩「空档 + 主导告警」两段
+    assert body["count"] == 2
+    lead, main = body["segments"]
+    assert lead["alert_no"] is None and lead["to"] == high["effective_from"]
+    assert main["alert_no"] == high["alert_no"]
+    assert main["from"] == high["effective_from"] and main["to"] == body["to"]
+    assert_segments_match_point_query(client, a, body)
+
+
+# ---------------------------------------------------------------- 时段查询：综合一致性
+
+def test_schedule_complex_scenario_matches_point_query(client):
+    a, other = area(), area()
+    # 贯穿窗口的中级别告警
+    mid = client.post("/api/commands/publish", json=publish_payload(
+        areas=[a], level=3, message="中级别", duration_seconds=3600)).json()
+    # 窗口内生效又到期的最高级别告警（抢占与恢复）
+    client.post("/api/commands/publish", json=publish_payload(
+        areas=[a], level=5, message="最高级别", delay_seconds=2, duration_seconds=8))
+    # 窗口内被修订的告警（版本切换：级别 2→4，文案变更）
+    am_pub = client.post("/api/commands/publish", json=publish_payload(
+        areas=[a], level=2, message="待修订", duration_seconds=3600)).json()
+    do_amend(client, am_pub["alert_no"], areas=[a], level=4, message="已修订")
+    # 窗口内被撤销的告警（撤销边界）
+    rv_pub = client.post("/api/commands/publish", json=publish_payload(
+        areas=[a], level=2, message="待撤销", duration_seconds=3600)).json()
+    client.post("/api/commands/revoke",
+                json={"request_no": rid(), "alert_no": rv_pub["alert_no"]})
+    # 其他区域的告警（不应出现在本区域片段中）
+    other_pub = client.post("/api/commands/publish", json=publish_payload(
+        areas=[other], level=5, duration_seconds=3600)).json()
+
+    frm = iso(parse(mid["effective_from"]) - timedelta(seconds=2))
+    to = iso(parse(mid["effective_from"]) + timedelta(seconds=30))
+    body = schedule(client, a, frm, to).json()
+    assert_tiling(body)
+    assert_segments_match_point_query(client, a, body)
+    assert all(s["alert_no"] != other_pub["alert_no"] for s in body["segments"])
+
+    # 密集采样：窗口内每 200ms 的时刻，单点查询裁决都与所在片段一致
+    segs = body["segments"]
+    t, end_t = parse(frm), parse(to)
+    while t < end_t:
+        seg = next(s for s in segs if parse(s["from"]) <= t < parse(s["to"]))
+        res = broadcast(client, a, at=iso(t))
+        if seg["alert_no"] is None:
+            assert res == [], (iso(t), seg, res)
+        else:
+            assert len(res) == 1, (iso(t), seg, res)
+            assert res[0]["alert_no"] == seg["alert_no"], (iso(t), seg, res)
+            assert res[0]["level"] == seg["level"]
+            assert res[0]["message"] == seg["message"]
+        t += timedelta(milliseconds=200)
+
+
+def test_schedule_tiling_holds_under_concurrent_writes(client):
+    """并发提交命令期间反复查询：每次响应都完整平铺区间且相邻片段不同。"""
+    a = area()
+    base = client.post("/api/commands/publish", json=publish_payload(
+        areas=[a], level=3, duration_seconds=3600)).json()
+    frm = iso(parse(base["effective_from"]) - timedelta(seconds=2))
+    to = iso(parse(base["effective_from"]) + timedelta(seconds=20))
+    stop = threading.Event()
+
+    def writer():
+        while not stop.is_set():
+            do_publish(client, areas=[a], level=random.choice([1, 2, 4, 5]),
+                       duration_seconds=3600)
+
+    t = threading.Thread(target=writer, daemon=True)
+    t.start()
+    try:
+        for _ in range(30):
+            r = schedule(client, a, frm, to)
+            assert r.status_code == 200, r.text
+            assert_tiling(r.json())
+    finally:
+        stop.set()
+        t.join()

@@ -8,7 +8,13 @@ from fastapi import FastAPI, Query, Response
 
 from . import db
 from .schemas import AmendCommand, PublishCommand, RevokeCommand
-from .service import handle_amend, handle_publish, handle_revoke, query_broadcast
+from .service import (
+    handle_amend,
+    handle_publish,
+    handle_revoke,
+    query_broadcast,
+    query_broadcast_schedule,
+)
 
 
 @asynccontextmanager
@@ -21,7 +27,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="园区应急广播播发裁决服务",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -36,6 +42,7 @@ def index():
             "POST /api/commands/amend",
             "POST /api/commands/revoke",
             "GET  /api/broadcast?at=<ISO8601>&area=<区域>",
+            "GET  /api/broadcast/schedule?area=<区域>&from=<ISO8601>&to=<ISO8601>",
             "GET  /healthz",
         ],
     }
@@ -77,3 +84,18 @@ def broadcast(
 ):
     """查询指定时刻各区域应播发的告警；无有效告警时 results 为空列表。"""
     return query_broadcast(at, area)
+
+
+@app.get("/api/broadcast/schedule")
+def broadcast_schedule(
+    area: str = Query(description="限定区域"),
+    from_: datetime = Query(alias="from", description="区间起点（含），ISO 8601，须带时区"),
+    to: datetime = Query(description="区间终点（不含），ISO 8601，须带时区"),
+):
+    """查询某区域在 [from, to) 时段内实际应播发的片段序列。
+
+    返回按时间升序、无缝覆盖整个区间、互不重叠的左闭右开片段；无告警的空档
+    以空告警（alert_no/level/message 为 null）表示；相邻内容相同的片段已合并；
+    边界时刻属于后一段。起点须早于终点且跨度不超过 24 小时。
+    """
+    return query_broadcast_schedule(area, from_, to)

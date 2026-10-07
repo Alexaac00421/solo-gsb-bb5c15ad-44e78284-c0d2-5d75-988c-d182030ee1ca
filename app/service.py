@@ -1,4 +1,4 @@
-"""播发裁决核心逻辑：命令受理（幂等）、修订、撤销、按时刻裁决查询。
+"""播发裁决核心逻辑：命令受理（幂等）、修订、撤销、按时刻/按时段裁决查询。
 
 事务约定：
 - 每条命令在单个数据库事务内完成「回执登记 + 业务写入」，任一步失败整体回滚，
@@ -402,5 +402,149 @@ def query_broadcast(at: datetime | None, area: str | None) -> dict[str, Any]:
                 "effective_to": _iso(r["end_at"]),
             }
             for r in rows
+        ],
+    }
+
+
+# 时段查询的跨度上限：起点须早于终点，且跨度不超过 24 小时
+MAX_SCHEDULE_SPAN = timedelta(hours=24)
+
+
+def query_broadcast_schedule(area: str, start: datetime, end: datetime) -> dict[str, Any]:
+    """时段裁决查询：某区域在 [start, end) 内实际应播发的片段序列。
+
+    返回按时间升序、无缝覆盖整个请求区间且互不重叠的左闭右开片段；每段给出
+    起止时刻与当版告警（告警号/级别/文案），无告警的空档以空告警（null）表示，
+    相邻内容完全相同的片段已合并，边界时刻属于后一段。
+
+    一致性保证：
+    - 全部数据由**一条** SELECT 读取——READ COMMITTED 下单条语句即一个一致性
+      快照，查询期间提交的命令不会混入本次结果；
+    - 在该快照上收集全部候选边界（告警生效/到期/撤销、修订版本切换），边界之间
+      裁决结果恒定，逐段在左端点以与 query_broadcast 完全相同的规则回放
+      （版本按时刻取 valid_from 最新者；级别高 → 受理时间早 → 告警号小），
+      因此片段内任意时刻的裁决都与单点查询在该时刻的结果一致。
+    """
+    if not area or not area.strip():
+        raise HTTPException(status_code=422, detail="区域名称不能为空或全为空白字符")
+    if start.tzinfo is None or start.tzinfo.utcoffset(start) is None:
+        raise HTTPException(status_code=422, detail="参数 from 必须携带时区偏移（如 2026-10-06T08:00:00Z）")
+    if end.tzinfo is None or end.tzinfo.utcoffset(end) is None:
+        raise HTTPException(status_code=422, detail="参数 to 必须携带时区偏移（如 2026-10-06T09:00:00Z）")
+
+    start = start.astimezone(timezone.utc)
+    end = end.astimezone(timezone.utc)
+    if start >= end:
+        raise HTTPException(status_code=422, detail="区间起点必须早于终点（from < to）")
+    if end - start > MAX_SCHEDULE_SPAN:
+        raise HTTPException(status_code=422, detail="区间跨度不能超过 24 小时")
+
+    # 单条语句 = 同一已提交快照：取出窗口内可能影响本区域裁决的告警及其全部版本。
+    # 过滤条件只排除「整窗都不可能在本区域播发」的告警（未开始/已结束/已撤销/
+    # 任何版本都未覆盖本区域），不影响窗口内的裁决结果。
+    sql = """
+        SELECT a.alert_no, a.accepted_at, a.start_at, a.end_at, a.revoked_at,
+               v.version_no, v.level, v.message, v.valid_from,
+               (SELECT jsonb_agg(aav.area ORDER BY aav.area)
+                  FROM alert_area_versions aav
+                 WHERE aav.alert_no = v.alert_no
+                   AND aav.version_no = v.version_no) AS areas
+        FROM alerts a
+        JOIN alert_versions v ON v.alert_no = a.alert_no
+        WHERE a.start_at < %(to)s
+          AND a.end_at > %(from)s
+          AND (a.revoked_at IS NULL OR a.revoked_at > %(from)s)
+          AND EXISTS (SELECT 1 FROM alert_area_versions x
+                      WHERE x.alert_no = a.alert_no AND x.area = %(area)s)
+        ORDER BY a.alert_no, v.version_no
+    """
+    with get_pool().connection() as conn:
+        rows = conn.execute(sql, {"area": area, "from": start, "to": end}).fetchall()
+
+    # 按告警聚合版本链（每版含当版级别/文案/覆盖区域）
+    alerts: dict[int, dict[str, Any]] = {}
+    for r in rows:
+        alert = alerts.setdefault(
+            r["alert_no"],
+            {
+                "alert_no": r["alert_no"],
+                "accepted_at": r["accepted_at"],
+                "start_at": r["start_at"],
+                "end_at": r["end_at"],
+                "revoked_at": r["revoked_at"],
+                "versions": [],
+            },
+        )
+        alert["versions"].append(
+            {
+                "version_no": r["version_no"],
+                "level": r["level"],
+                "message": r["message"],
+                "valid_from": r["valid_from"],
+                "areas": set(r["areas"] or []),
+            }
+        )
+
+    # 候选边界：窗口内任何候选告警的生效/到期/撤销/版本切换时刻。
+    # 相邻边界之间裁决结果恒定，故每段只需在左端点（左闭）取一次裁决。
+    boundaries = {start, end}
+    for alert in alerts.values():
+        for t in (alert["start_at"], alert["end_at"], alert["revoked_at"]):
+            if t is not None and start < t < end:
+                boundaries.add(t)
+        for v in alert["versions"]:
+            if start < v["valid_from"] < end:
+                boundaries.add(v["valid_from"])
+    ordered = sorted(boundaries)
+
+    def winner_at(moment: datetime) -> dict[str, Any] | None:
+        """与 query_broadcast 相同的裁决：级别高 → 受理时间早 → 告警号小。"""
+        best: dict[str, Any] | None = None
+        best_key: tuple[Any, ...] | None = None
+        for alert in alerts.values():
+            if not (alert["start_at"] <= moment < alert["end_at"]):
+                continue
+            if alert["revoked_at"] is not None and moment >= alert["revoked_at"]:
+                continue
+            version = max(
+                (v for v in alert["versions"] if v["valid_from"] <= moment),
+                key=lambda v: (v["valid_from"], v["version_no"]),
+                default=None,
+            )
+            if version is None or area not in version["areas"]:
+                continue
+            key = (-version["level"], alert["accepted_at"], alert["alert_no"])
+            if best_key is None or key < best_key:
+                best_key = key
+                best = {
+                    "alert_no": alert["alert_no"],
+                    "level": version["level"],
+                    "message": version["message"],
+                }
+        return best
+
+    # 逐段裁决并合并相邻内容相同的片段；边界时刻归属后一段（左闭右开）
+    segments: list[dict[str, Any]] = []
+    for seg_start, seg_end in zip(ordered, ordered[1:]):
+        winner = winner_at(seg_start)
+        if segments and segments[-1]["winner"] == winner:
+            segments[-1]["to"] = seg_end
+        else:
+            segments.append({"from": seg_start, "to": seg_end, "winner": winner})
+
+    return {
+        "area": area,
+        "from": _iso(start),
+        "to": _iso(end),
+        "count": len(segments),
+        "segments": [
+            {
+                "from": _iso(s["from"]),
+                "to": _iso(s["to"]),
+                "alert_no": s["winner"]["alert_no"] if s["winner"] else None,
+                "level": s["winner"]["level"] if s["winner"] else None,
+                "message": s["winner"]["message"] if s["winner"] else None,
+            }
+            for s in segments
         ],
     }
