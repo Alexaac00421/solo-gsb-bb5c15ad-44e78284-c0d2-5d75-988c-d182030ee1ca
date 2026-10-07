@@ -404,3 +404,118 @@ def query_broadcast(at: datetime | None, area: str | None) -> dict[str, Any]:
             for r in rows
         ],
     }
+
+
+def query_broadcast_timeline(area: str, start: datetime, end: datetime) -> dict[str, Any]:
+    """时间线查询：区域 area 在 [start, end) 内的应播片段序列。
+
+    某区域的裁决结果只可能在告警生效（start_at）、到期（end_at）、撤销
+    （revoked_at）、修订版本切换（valid_from，内容/级别/区域随版本整体替换）
+    这些时刻变化，因此：
+    1. 用一条 SELECT 取出与区间相交且任一版本覆盖该区域的告警及其全部版本——
+       单条语句在语句级快照上执行，不会混入查询进行期间提交的命令；
+    2. 收集区间内部的全部候选边界点，把 [start, end) 切成左闭右开子区间，
+       子区间内部裁决不变，取左端点按单点查询同一套规则
+       （级别高 → 受理时间早 → 告警号小）求值，边界时刻自然归入后一段；
+    3. 相邻结果完全相同的片段合并；无告警的空档以空告警（null）表示。
+    """
+    sql = """
+        SELECT a.alert_no, a.accepted_at, a.start_at, a.end_at, a.revoked_at,
+               v.version_no, v.level, v.message, v.valid_from,
+               (aav.area IS NOT NULL) AS in_area
+        FROM alerts a
+        JOIN alert_versions v ON v.alert_no = a.alert_no
+        LEFT JOIN alert_area_versions aav
+               ON aav.alert_no = v.alert_no
+              AND aav.version_no = v.version_no
+              AND aav.area = %(area)s
+        WHERE a.start_at < %(to)s
+          AND a.end_at > %(from)s
+          AND (a.revoked_at IS NULL OR a.revoked_at > %(from)s)
+          AND EXISTS (
+              SELECT 1 FROM alert_area_versions x
+              WHERE x.alert_no = a.alert_no AND x.area = %(area)s
+          )
+        ORDER BY a.alert_no, v.version_no
+    """
+    with get_pool().connection() as conn:
+        rows = conn.execute(sql, {"area": area, "from": start, "to": end}).fetchall()
+
+    # 按告警归集版本，按 (valid_from, version_no) 升序——与单点查询
+    # “valid_from <= t 的最新版（同刻取版本号大者）”选取规则互为镜像
+    alerts: dict[int, dict[str, Any]] = {}
+    for r in rows:
+        a = alerts.get(r["alert_no"])
+        if a is None:
+            a = alerts[r["alert_no"]] = {
+                "alert_no": r["alert_no"],
+                "accepted_at": r["accepted_at"],
+                "start_at": r["start_at"],
+                "end_at": r["end_at"],
+                "revoked_at": r["revoked_at"],
+                "versions": [],
+            }
+        a["versions"].append(
+            (r["valid_from"], r["version_no"], r["level"], r["message"], r["in_area"])
+        )
+    for a in alerts.values():
+        a["versions"].sort(key=lambda v: (v[0], v[1]))
+
+    # 候选边界：生效、到期、撤销、版本切换（只取区间内部点，端点另行加入）
+    points = {start, end}
+    for a in alerts.values():
+        for p in (a["start_at"], a["end_at"], a["revoked_at"]):
+            if p is not None and start < p < end:
+                points.add(p)
+        for valid_from, *_ in a["versions"]:
+            if start < valid_from < end:
+                points.add(valid_from)
+    boundaries = sorted(points)
+
+    def winner_at(t: datetime) -> tuple[int, int, str] | None:
+        """t 时刻的裁决结果 (alert_no, level, message)，与单点查询规则一致。"""
+        best_key: tuple[Any, ...] | None = None
+        best: tuple[int, int, str] | None = None
+        for a in alerts.values():
+            if not (a["start_at"] <= t < a["end_at"]):
+                continue
+            if a["revoked_at"] is not None and t >= a["revoked_at"]:
+                continue
+            version = None
+            for v in a["versions"]:  # 升序遍历，最后一个 valid_from <= t 的即当版
+                if v[0] > t:
+                    break
+                version = v
+            if version is None or not version[4]:  # 无当版或当版不覆盖该区域
+                continue
+            key = (-version[2], a["accepted_at"], a["alert_no"])
+            if best_key is None or key < best_key:
+                best_key = key
+                best = (a["alert_no"], version[2], version[3])
+        return best
+
+    # 逐子区间求值（左端点代表整个左闭右开区间），合并相邻相同结果
+    segments: list[dict[str, Any]] = []
+    for left, right in zip(boundaries, boundaries[1:]):
+        winner = winner_at(left)
+        if segments and segments[-1]["winner"] == winner:
+            segments[-1]["to"] = right
+        else:
+            segments.append({"from": left, "to": right, "winner": winner})
+
+    return {
+        "area": area,
+        "from": _iso(start),
+        "to": _iso(end),
+        "count": len(segments),
+        "segments": [
+            {
+                "from": _iso(s["from"]),
+                "to": _iso(s["to"]),
+                "alert_no": s["winner"][0] if s["winner"] else None,
+                "level": s["winner"][1] if s["winner"] else None,
+                "message": s["winner"][2] if s["winner"] else None,
+            }
+            for s in segments
+        ],
+    }

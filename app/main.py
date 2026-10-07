@@ -2,13 +2,19 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from fastapi import FastAPI, Query, Response
+from fastapi import FastAPI, HTTPException, Query, Response
 
 from . import db
 from .schemas import AmendCommand, PublishCommand, RevokeCommand
-from .service import handle_amend, handle_publish, handle_revoke, query_broadcast
+from .service import (
+    handle_amend,
+    handle_publish,
+    handle_revoke,
+    query_broadcast,
+    query_broadcast_timeline,
+)
 
 
 @asynccontextmanager
@@ -21,7 +27,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="园区应急广播播发裁决服务",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -36,6 +42,7 @@ def index():
             "POST /api/commands/amend",
             "POST /api/commands/revoke",
             "GET  /api/broadcast?at=<ISO8601>&area=<区域>",
+            "GET  /api/broadcast/timeline?area=<区域>&from=<ISO8601>&to=<ISO8601>",
             "GET  /healthz",
         ],
     }
@@ -77,3 +84,28 @@ def broadcast(
 ):
     """查询指定时刻各区域应播发的告警；无有效告警时 results 为空列表。"""
     return query_broadcast(at, area)
+
+
+# 时间线查询单次区间的最大跨度
+MAX_TIMELINE_SPAN = timedelta(hours=24)
+
+
+@app.get("/api/broadcast/timeline")
+def broadcast_timeline(
+    area: str = Query(..., min_length=1, description="区域名称"),
+    from_: datetime = Query(..., alias="from", description="起始时刻（含），ISO 8601，须带时区"),
+    to: datetime = Query(..., description="结束时刻（不含），ISO 8601，须带时区"),
+):
+    """查询区域在 [from, to) 时段内的应播时间线。
+
+    返回按时间升序、互不重叠、完整覆盖请求区间的左闭右开片段；每段与单点查询
+    在该段内任意时刻的裁决一致，空档以空告警（null）表示，相邻相同结果已合并。
+    """
+    for name, moment in (("from", from_), ("to", to)):
+        if moment.tzinfo is None or moment.tzinfo.utcoffset(moment) is None:
+            raise HTTPException(status_code=422, detail=f"时刻参数 {name} 必须携带时区偏移")
+    if from_ >= to:
+        raise HTTPException(status_code=422, detail="起始时刻必须早于结束时刻")
+    if to - from_ > MAX_TIMELINE_SPAN:
+        raise HTTPException(status_code=422, detail="查询区间跨度不能超过 24 小时")
+    return query_broadcast_timeline(area, from_, to)
